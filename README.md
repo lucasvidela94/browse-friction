@@ -1,6 +1,10 @@
 # browse-friction
 
-Two commands for finding and reporting frictions in [browse](https://github.com/anomalyco/browse) by using it, not by reading it.
+Tooling for [**anomalyco/browse**](https://github.com/anomalyco/browse) — the MCP server and Chromium extension that lets an agent drive a real browser. This repo is **not** part of it and is not published by Anomaly: it is two scripts that use the installed `browse` CLI to find frictions, reduce them, and write issues for that repo.
+
+**Findings go to [anomalyco/browse/issues](https://github.com/anomalyco/browse/issues), never here.** This repo only holds the tools that produce them.
+
+Two commands for finding and reporting frictions in browse by using it, not by reading it.
 
 - **`browse-friction`** packs one tab's evidence: the compact snapshot, the aria snapshot, `innerText`, the page markup, a screenshot, and the versions — then compares them and writes `REPORT.md` with the numbers filled in and the sections still empty.
 - **`browse-corpus`** runs that over a set of hostile pages and diffs each case against the previous run, so a change between browse versions shows up as a diff instead of as a surprise weeks later.
@@ -53,6 +57,21 @@ Baselines are per case: `--only nav-rows` compares with the newest run that has 
 ## Comparing two builds
 
 The relay captures the pages, not the CLI. Pointing `--browse` at a candidate binary tests nothing unless that binary is the one behind the relay, and swapping the relay costs the extension's reconnect delay. The run prints the relay version and warns when the two disagree.
+
+## The agent half
+
+`skill/SKILL.md` is the same discipline as a skill that fires by itself when a browse call is silent or contradictory: pack, compare, reduce, file — plus the traps worth knowing before blaming the tool. Link it instead of copying it:
+
+```sh
+mkdir -p ~/.config/opencode/skills/browse-friction
+ln -s ~/Code/labs/browse-friction/skill/SKILL.md ~/.config/opencode/skills/browse-friction/SKILL.md
+```
+
+A fresh OpenCode reads it on start.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
 
 ## Why these flags and not a log
 
