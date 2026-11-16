@@ -136,7 +136,10 @@ def flags_for(page, snapshot, aria, inner_text):
             f"(the shape of browse #283): {empty_landmarks[0].strip()[:90]}",
         ))
 
-    if not truncated and not dialog_scoped and len(aria_controls) > len(compact_controls) + declared + 2:
+    # Only the unambiguous case: nothing at all. A snapshot with some controls is
+    # legitimately partial (overlays, maxItems, lazy sections, dialog scoping) and
+    # flagging the difference turns the pack into noise.
+    if not compact_controls and not truncated and not dialog_scoped and len(aria_controls) > 2:
         out.append((
             "controls missing",
             f"mode:aria lists {len(aria_controls)} controls; the snapshot shows {len(compact_controls)} "
