@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""Run browse across a corpus of hostile pages and diff it against the last run.
+
+Each case is inspected with `browse-friction` (compact snapshot, aria snapshot,
+innerText, DOM, screenshot), reduced to a signature, and compared with the same
+case in the previous run. What changes between versions is the thing worth an
+issue; what does not change is the thing worth not re-testing by hand.
+
+    browse-corpus                    # run, compare with the last run
+    browse-corpus --update           # run and make this the baseline
+    browse-corpus --list             # the cases
+    browse-corpus --diff nav-rows    # full snapshot diff for one case
+
+Cases live in ~/.config/browse-corpus/cases.json (written on first run).
+Exit 1 when something changed or a case regressed; 0 when the run matches.
+"""
+
+import argparse
+import difflib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+RUNS = Path.home() / ".local/state/browse-corpus/runs"
+CASES = Path.home() / ".config/browse-corpus/cases.json"
+FRICTION = shutil.which("browse-friction") or "browse-friction"
+BROWSE = os.environ.get("BROWSE_BIN") or shutil.which("browse") or "browse"
+
+DEFAULT_CASES = {
+    "note": "Hostile markup for browse's compact snapshot. html cases run on about:blank.",
+    "cases": [
+        {
+            "name": "nav-rows",
+            "why": "#283: a landmark whose rows are div[role=button] must not be summarised away",
+            "html": '<main><nav aria-label="Thread list"><h2>Your messages</h2>'
+                    '<div role="button" tabindex="0"><div><span>alice</span><span>hi</span></div></div>'
+                    '<div role="button" tabindex="0"><div><span>bob</span></div></div></nav>'
+                    '<p>content</p><button>Send message</button></main>',
+        },
+        {
+            "name": "nav-outside-main",
+            "why": "#289: a landmark outside <main> disappears with no note",
+            "html": '<nav aria-label="Thread list"><h2>Your messages</h2>'
+                    '<div role="button" tabindex="0"><div><span>alice</span></div></div></nav>'
+                    '<main><p>content</p><button>Send message</button></main>',
+        },
+        {
+            "name": "menubar-links",
+            "why": "ARIA menubar where each menuitem wraps a link: count and collapse",
+            "html": '<main><nav aria-label="Docs"><ul role="menubar">'
+                    '<li role="menuitem"><a href="/a">Alpha</a></li>'
+                    '<li role="menuitem"><a href="/b">Beta</a></li>'
+                    '<li role="menuitem"><a href="/c">Gamma</a></li>'
+                    '</ul></nav><p>content</p></main>',
+        },
+        {
+            "name": "mixed-nav",
+            "why": "links plus a search field: must not hide the field behind a count",
+            "html": '<main><nav aria-label="Primary"><a href="/one">one</a><a href="/two">two</a></nav>'
+                    '<nav aria-label="Search"><a href="/s">Settings</a><input placeholder="Filter"></nav>'
+                    '<h1>Page</h1></main>',
+        },
+        {
+            "name": "link-heavy-aside",
+            "why": "a link sidebar is the noise case: it should still collapse",
+            "html": '<main><aside aria-label="Sidebar">'
+                    + "".join(f'<a href="/{c}">{c}</a>' for c in "abcdefgh") +
+                    '</aside><h1>Page</h1></main>',
+        },
+        {
+            "name": "no-main",
+            "why": "the original repro: nothing here may be lost",
+            "html": '<div><h2>A</h2><div role="button" tabindex="0"><span>alice</span></div></div>'
+                    '<section><h2>B</h2><div role="button" tabindex="0">bob</div></section>'
+                    '<nav aria-label="C nav"><h2>C nav</h2><div role="button" tabindex="0"><div><span>carol</span></div></div></nav>',
+        },
+        {
+            "name": "github-repo",
+            "why": "real page: 3 landmarks, 2 of them outside <main>",
+            "url": "https://github.com/anomalyco/browse",
+        },
+        {
+            "name": "docs-page",
+            "why": "real page: long link sidebar that should collapse",
+            "url": "https://doc.rust-lang.org/std/index.html",
+        },
+    ],
+}
+
+
+def run(*args, timeout=180):
+    return subprocess.run(list(args), capture_output=True, text=True, timeout=timeout)
+
+
+def load_cases():
+    if not CASES.exists():
+        CASES.parent.mkdir(parents=True, exist_ok=True)
+        CASES.write_text(json.dumps(DEFAULT_CASES, indent=2) + "\n")
+    return json.loads(CASES.read_text())["cases"]
+
+
+def strip_refs(text):
+    return re.sub(r"\[ref=[^\]]+\]", "[ref]", text)
+
+
+def signature(pack):
+    page = json.loads((pack / "page.json").read_text())
+    snap = (pack / "snapshot.txt").read_text()
+    aria = (pack / "aria.txt").read_text()
+    report = (pack / "REPORT.md").read_text()
+    flags = re.findall(r"^- \*\*(.+?)\*\* —", report, re.M)
+    return {
+        "url": page["url"],
+        "dom_controls": page["counts"]["controls"],
+        "snapshot_lines": len(snap.splitlines()),
+        "snapshot_controls": len(re.findall(r"^\s*- '?(?:button|link|textbox|searchbox|checkbox|radio|combobox|listbox|"
+                                            r"option|tab|menuitem|menuitemcheckbox|menuitemradio|switch|slider|"
+                                            r"spinbutton|treeitem|disclosure)\b", snap, re.M)),
+        "aria_lines": len(aria.splitlines()),
+        "flags": flags,
+        "snapshot": strip_refs(snap).splitlines(),
+    }
+
+
+def inspect(case, run_dir):
+    tab = None
+    if case.get("html"):
+        nav = run(BROWSE, "navigate", "about:blank")
+        tab = json.loads(nav.stdout)["tab"]
+        script = f"document.body.innerHTML = {json.dumps(case['html'])}; 'ok'"
+        res = run(BROWSE, "eval", str(tab), script)
+        if res.returncode != 0:
+            raise RuntimeError(res.stderr or res.stdout)
+    pack = run_dir / case["name"]
+    args = [FRICTION, "--out", str(pack)]
+    args += ["--tab", str(tab)] if tab else ["--url", case["url"]]
+    res = run(*args)
+    if tab:
+        run(BROWSE, "tabs", "close", "--tab", str(tab))
+    if res.returncode != 0:
+        raise RuntimeError((res.stderr or res.stdout).strip().splitlines()[-1:][0] if res.stderr or res.stdout else "?")
+    return signature(pack)
+
+
+def baseline_for(case_name, except_dir):
+    """The newest run that has this case. Per case, so a --only run compares with
+    the full run before it instead of starting from nothing."""
+    runs = sorted((p for p in RUNS.glob("*") if p.is_dir() and p != except_dir), key=lambda p: p.name)
+    for run in reversed(runs):
+        if (run / case_name / "page.json").exists():
+            return run
+    return None
+
+
+def diff_case(old, new, name, verbose):
+    out = []
+    if old["snapshot"] != new["snapshot"]:
+        out.append("  snapshot changed:")
+        if verbose:
+            out += ["    " + l for l in difflib.unified_diff(
+                old["snapshot"], new["snapshot"], n=1, lineterm="", fromfile="before", tofile="after")][:40]
+        else:
+            added = [l for l in new["snapshot"] if l not in old["snapshot"]]
+            removed = [l for l in old["snapshot"] if l not in new["snapshot"]]
+            out += ["    + " + l[:110] for l in added[:6]]
+            out += ["    - " + l[:110] for l in removed[:6]]
+    for key in ("dom_controls", "snapshot_lines", "snapshot_controls", "aria_lines"):
+        if old[key] != new[key]:
+            out.append(f"  {key}: {old[key]} → {new[key]}")
+    gained = [f for f in new["flags"] if f not in old["flags"]]
+    lost = [f for f in old["flags"] if f not in new["flags"]]
+    for f in gained:
+        out.append(f"  ! flag appeared: {f}")
+    for f in lost:
+        out.append(f"  ✓ flag gone: {f}")
+    return out, gained
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Run browse over a corpus and diff against the last run.")
+    ap.add_argument("--update", action="store_true", help="make this run the baseline even if it differs")
+    ap.add_argument("--list", action="store_true", help="print the cases and exit")
+    ap.add_argument("--diff", metavar="CASE", help="full snapshot diff for one case, then exit")
+    ap.add_argument("--only", metavar="NAME", help="run a single case")
+    ap.add_argument("--browse", metavar="PATH", help="browse binary to test (default: the installed one)")
+    ap.add_argument("--keep", type=int, default=20, metavar="N", help="keep the newest N runs (default 20)")
+    ap.add_argument("--ci", action="store_true", help="fail only when a new flag appears, not when anything changed")
+    args = ap.parse_args()
+
+    global BROWSE
+    if args.browse:
+        BROWSE = str(Path(args.browse).resolve())
+        os.environ["BROWSE_BIN"] = BROWSE
+    cases = load_cases()
+    if args.list:
+        for c in cases:
+            print(f"{c['name']:<20} {'html' if c.get('html') else c['url']}\n{'':<20} {c.get('why','')}")
+        return 0
+
+    if args.diff:
+        runs = [p for p in sorted((p for p in RUNS.glob("*") if p.is_dir()), key=lambda p: p.name)
+                if (p / args.diff / "page.json").exists()]
+        if len(runs) < 2:
+            print("need two runs with that case to diff", file=sys.stderr)
+            return 2
+        old, newest = runs[-2], runs[-1]
+        a = json.loads((old / args.diff / "page.json").read_text()) if (old / args.diff).exists() else None
+        if not a:
+            print(f"{args.diff} not in {old}", file=sys.stderr)
+            return 2
+        before = strip_refs((old / args.diff / "snapshot.txt").read_text()).splitlines()
+        after = strip_refs((newest / args.diff / "snapshot.txt").read_text()).splitlines()
+        print("\n".join(difflib.unified_diff(before, after, fromfile=f"{old.name}/{args.diff}", tofile=f"{newest.name}/{args.diff}", lineterm="")))
+        return 0
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    run_dir = RUNS / stamp
+    run_dir.mkdir(parents=True, exist_ok=True)
+    changes = 0
+    bases = set()
+    failed = []
+    for case in cases:
+        if args.only and case["name"] != args.only:
+            continue
+        try:
+            sig = inspect(case, run_dir)
+        except Exception as exc:  # noqa: BLE001 - a broken case must not stop the run
+            print(f"{case['name']:<20} SKIP — {exc}")
+            failed.append(case["name"])
+            continue
+
+        base = baseline_for(case["name"], run_dir)
+        old = signature(base / case["name"]) if base else None
+        if base:
+            bases.add(base.name)
+
+        line = f"{case['name']:<20} {sig['snapshot_controls']:>2} ctrl · {sig['aria_lines']:>3} aria · {len(sig['flags'])} flag"
+        if old is None:
+            print(line + "  (baseline)")
+            continue
+        delta, regressions = diff_case(old, sig, case["name"], verbose=bool(args.diff))
+        if regressions or (delta and not args.ci):
+            changes += 1
+            print(line + ("  REGRESSION" if regressions else "  CHANGED"))
+            print("\n".join(delta))
+        elif delta:
+            print(line + "  changed (ok in --ci)")
+        else:
+            print(line)
+
+    # What actually captured the pages: the relay does it, not the CLI that asked.
+    first = next((d / "status.json" for d in sorted(run_dir.iterdir()) if (d / "status.json").exists()), None)
+    if first:
+        st = json.loads(first.read_text())
+        relay = (st.get("relay") or {}).get("version", "?")
+        ext = (st.get("extension") or {})
+        exe = (st.get("setup") or {}).get("executable", "?")
+        print(f"\nrelay: {relay} · extension {ext.get('version') or '?'} ({ext.get('pairingState') or '?'}) · cli: {exe}")
+        if args.browse and Path(args.browse).resolve() != Path(exe).resolve():
+            print("note: --browse is not the binary behind that relay; the relay captures, so this run may not test it")
+
+    runs = sorted((p for p in RUNS.glob("*") if p.is_dir()), key=lambda p: p.name)
+    for old in runs[:-max(1, args.keep)]:
+        shutil.rmtree(old, ignore_errors=True)
+
+    print(f"run: {run_dir}")
+    if bases:
+        print(f"compared with: {', '.join(sorted(bases))}")
+        if changes and not args.update:
+            what = "regressed" if args.ci else "changed"
+            print(f"{changes} case(s) {what}. `--update` to accept this as the baseline, `--diff <case>` for the full diff.")
+            return 1
+        print("no changes")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

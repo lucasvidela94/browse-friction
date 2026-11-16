@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""Pack one tab's evidence so a browse friction can be reported or reproduced.
+
+Collects the five independent views of the same instant (compact snapshot, aria
+snapshot, DOM text, DOM markup, screenshot) plus the versions, compares the ones
+that should agree, and writes a REPORT.md skeleton with the numbers filled in.
+
+    browse-friction --url https://www.instagram.com/direct/inbox/
+    browse-friction --tab 12 --name ig-inbox
+
+Exit code is 0 when the pack was written, 1 when it could not be, and 2 when a
+browse command failed. Flags are not errors: a clean page legitimately has none.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+BROWSE = os.environ.get("BROWSE_BIN") or shutil.which("browse") or "browse"
+MAX_DOM_BYTES = 400_000
+
+COUNTS_JS = """(() => {
+  const q = (s) => document.querySelectorAll(s).length;
+  const counts = {
+    buttons: q("button"),
+    role_buttons: q("[role=button]"),
+    links: q("a[href]"),
+    fields: q("input, select, textarea"),
+    editables: q("[contenteditable=true]"),
+    landmarks: q("nav, aside, [role=navigation], [role=complementary]"),
+    frames: q("iframe"),
+  };
+  counts.controls = counts.buttons + counts.role_buttons + counts.links + counts.fields + counts.editables;
+  return {
+    url: location.href,
+    title: document.title,
+    viewport: [innerWidth, innerHeight],
+    counts,
+    text_lines: document.body.innerText.split("\\n").filter((l) => l.trim()).length,
+  };
+})()"""
+
+
+def die(msg, code=2):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def sh(*args):
+    p = subprocess.run([BROWSE, *args], capture_output=True, text=True)
+    if p.returncode != 0:
+        die(f"`browse {' '.join(args)}` failed:\n{(p.stderr or p.stdout).strip()}")
+    return p
+
+
+def sh_json(*args):
+    p = sh(*args)
+    try:
+        return json.loads(p.stdout)
+    except json.JSONDecodeError:
+        return {"raw": p.stdout.strip(), "stderr": p.stderr.strip()}
+
+
+def write(path: Path, text: str):
+    path.write_text(text if text.endswith("\n") else text + "\n")
+
+
+def lines(pattern, text):
+    return [l for l in text.splitlines() if re.search(pattern, l)]
+
+
+CONTROL_ROLES = (
+    "button|link|textbox|searchbox|checkbox|radio|combobox|listbox|option|tab|"
+    "menuitem|menuitemcheckbox|menuitemradio|switch|slider|spinbutton|treeitem|disclosure"
+)
+
+
+def controls_in(text):
+    """Count entries whose role is a control. Total refs are a bad comparison: aria
+    marks generic containers too, so the same page legitimately differs there."""
+    return [l for l in text.splitlines() if re.search(rf"- '?(?:{CONTROL_ROLES})\b", l)]
+
+
+def declared_in(text):
+    """Controls a collapsed landmark says it holds: `- navigation "X" [8 controls]`."""
+    return sum(int(n) for n in re.findall(r"- navigation .*?\[(\d+) controls?\]", text))
+
+
+def flags_for(page, snapshot, aria, inner_text):
+    """The checks that would have caught this session's silent bugs, and nothing else:
+    a correctly collapsed sidebar declares its controls, so it is not a finding."""
+    c = page["counts"]
+    refs = len(re.findall(r"\[ref=", snapshot))
+    aria_refs = len(re.findall(r"\[ref=", aria))
+    compact_controls = controls_in(snapshot)
+    aria_controls = controls_in(aria)
+    declared = declared_in(snapshot)
+    empty_landmarks = lines(r"\[0 controls\]", snapshot)
+    fields_in_snapshot = [l for l in snapshot.splitlines()
+                          if re.search(r"- '?(?:textbox|searchbox|combobox|checkbox|radio|slider|spinbutton)\b", l)]
+    out = []
+
+    if c["controls"] > 0 and not compact_controls and declared == 0:
+        out.append(("no controls", f"the DOM has {c['controls']} controls and the snapshot exposes none"))
+
+    if empty_landmarks:
+        out.append((
+            "empty landmark",
+            f"{len(empty_landmarks)} landmark(s) reported as `[0 controls]` on a page that renders content "
+            f"(the shape of browse #283): {empty_landmarks[0].strip()[:90]}",
+        ))
+
+    if len(aria_controls) > len(compact_controls) + declared + 2:
+        out.append((
+            "controls missing",
+            f"mode:aria lists {len(aria_controls)} controls; the snapshot shows {len(compact_controls)} "
+            f"and declares {declared} collapsed",
+        ))
+
+    if c["fields"] > 0 and not fields_in_snapshot and declared > 0:
+        out.append((
+            "fields behind a summary",
+            f"the DOM has {c['fields']} field(s) and no field is visible while {declared} controls are hidden "
+            "behind collapsed landmarks",
+        ))
+
+    if not compact_controls and page["text_lines"] > 20:
+        out.append(("blank snapshot", f"no controls at all, but innerText has {page['text_lines']} lines"))
+
+    if not inner_text.strip() and page["text_lines"] > 0:
+        out.append(("text mismatch", "innerText is empty in the capture but the page reports text"))
+
+    return out, refs, aria_refs, len(compact_controls), len(aria_controls)
+
+
+def report(out_dir, page, status, snapshot, aria, inner_text, flag_list, refs, aria_refs, compact_controls, aria_controls, tab, kept):
+    ext = (status.get("extension") or {})
+    cli = ((status.get("relay") or {}).get("version")) or (status.get("setup") or {}).get("version") or "?"
+    connection = "connected" if status.get("connected") else (ext.get("pairingState") or "not connected")
+    c = page["counts"]
+
+    flag_block = "\n".join(f"- **{name}** — {msg}" for name, msg in flag_list) or "- none: the views agree"
+    body = f"""# Friction pack — {page['title'] or page['url']}
+
+| | |
+|---|---|
+| url | {page['url']} |
+| captured | {time.strftime('%Y-%m-%d %H:%M:%S %z')} |
+| tab | {tab}{' (left open)' if kept else ' (closed by the pack)'} |
+| browse | {cli} |
+| extension | {ext.get('version') or '?'} (protocol {ext.get('protocolVersion') or '?'}, {connection}) |
+
+## What the tools say, side by side
+
+| view | size | refs |
+|---|---|---|
+| compact snapshot | {len(snapshot.splitlines())} lines | {refs} refs, {compact_controls} controls, {declared_in(snapshot)} declared inside collapsed landmarks |
+| aria snapshot | {len(aria.splitlines())} lines | {aria_refs} refs, {aria_controls} controls |
+| innerText | {page['text_lines']} lines | — |
+| DOM | {c['controls']} controls ({c['buttons']} button, {c['role_buttons']} role=button, {c['links']} a[href], {c['fields']} fields) | {c['controls'] - compact_controls} not in the snapshot |
+| landmarks | {c['landmarks']} | — |
+
+## Automatic flags
+
+{flag_block}
+
+## What I expected
+
+<!-- one sentence: which call was supposed to do what -->
+
+## What happened
+
+<!-- paste the call and the exact reply; say which view above proves it wrong -->
+
+## Minimal repro
+
+<!-- the smallest HTML or URL that still reproduces it; the issue is actionable when this fits on a screen -->
+
+```html
+
+```
+
+## Artifacts
+
+- `snapshot.txt`, `aria.txt`, `innerText.txt`
+- `dom.html` (body markup, truncated at {MAX_DOM_BYTES // 1000}k)
+- `screenshot.png`
+- `page.json`, `status.json`
+- `replay.sh` — the same calls again
+"""
+    write(out_dir / "REPORT.md", body)
+
+
+def replay(out_dir, page, tab, kept):
+    script = f"""#!/bin/sh
+# Replay of the pack, from the same tab{'' if kept else '. Open the URL first: the tab was closed'}.
+# tab was {tab}
+browse snapshot {tab} > snapshot.txt
+browse snapshot {tab} --mode aria > aria.txt
+browse eval {tab} 'document.body.innerText' > innerText.txt
+browse screenshot --tab {tab} --output screenshot.png
+browse status --json > status.json
+# url: {page['url']}
+"""
+    p = out_dir / "replay.sh"
+    write(p, script)
+    p.chmod(0o755)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Pack one tab's evidence to report a browse friction.",
+        epilog="Reads only: it never clicks, types or navigates except --url.",
+    )
+    ap.add_argument("--tab", type=int, help="tab id to pack (from `browse tabs` or navigate)")
+    ap.add_argument("--url", help="open a new tab here first, then pack it")
+    ap.add_argument("--out", help="output directory (default ./friction-<slug>-<stamp>)")
+    ap.add_argument("--name", help="slug for the default directory name")
+    ap.add_argument("--keep", action="store_true", help="do not close the tab opened by --url")
+    args = ap.parse_args()
+
+    if bool(args.tab) == bool(args.url):
+        ap.error("pass exactly one of --tab or --url")
+
+    opened = False
+    tab = args.tab
+    if args.url:
+        nav = sh_json("navigate", args.url)
+        if "tab" not in nav:
+            die(f"navigate did not return a tab:\n{json.dumps(nav)[:500]}")
+        tab = nav["tab"]
+        opened = True
+
+    page = sh_json("eval", str(tab), COUNTS_JS)
+    if "counts" not in page:
+        die(f"could not read the page:\n{json.dumps(page)[:500]}")
+
+    slug = args.name or re.sub(r"[^a-z0-9]+", "-", (page["title"] or page["url"]).lower()).strip("-")[:40] or "page"
+    out_dir = Path(args.out or f"friction-{slug}-{time.strftime('%H%M%S')}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    status = sh_json("status", "--json")
+    snapshot = sh("snapshot", str(tab)).stdout
+    aria = sh("snapshot", str(tab), "--mode", "aria").stdout
+    inner_text = sh("eval", str(tab), "document.body.innerText").stdout
+    try:
+        dom = json.loads(sh("eval", str(tab), "document.body.outerHTML").stdout)
+    except json.JSONDecodeError:
+        dom = ""
+    dom = str(dom)[:MAX_DOM_BYTES]
+    sh("screenshot", "--tab", str(tab), "--output", str(out_dir / "screenshot.png"))
+
+    flag_list, refs, aria_refs, compact_controls, aria_controls = flags_for(page, snapshot, aria, inner_text)
+
+    write(out_dir / "snapshot.txt", snapshot)
+    write(out_dir / "aria.txt", aria)
+    write(out_dir / "innerText.txt", inner_text)
+    write(out_dir / "dom.html", dom)
+    write(out_dir / "page.json", json.dumps(page, indent=2, ensure_ascii=False))
+    write(out_dir / "status.json", json.dumps(status, indent=2, ensure_ascii=False))
+
+    kept = bool(args.tab) or args.keep
+    report(out_dir, page, status, snapshot, aria, inner_text, flag_list, refs, aria_refs, compact_controls, aria_controls, tab, kept)
+    replay(out_dir, page, tab, kept)
+
+    if opened and not args.keep:
+        sh("tabs", "close", "--tab", str(tab))
+
+    print(f"{out_dir}/REPORT.md")
+    print(f"  {page['url']}")
+    print(f"  compact {compact_controls} controls · aria {aria_controls} · DOM {page['counts']['controls']}")
+    for name, msg in flag_list:
+        print(f"  ! {name}: {msg}")
+    if not flag_list:
+        print("  no automatic flags — fill in what you expected vs what happened")
+
+
+if __name__ == "__main__":
+    main()
