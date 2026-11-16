@@ -10,7 +10,7 @@ Both read the browser through the installed `browse` CLI. Nothing else is needed
 ## Install
 
 ```sh
-git clone <this repo> ~/Code/labs/browse-friction
+git clone https://github.com/lucasvidela94/browse-friction ~/Code/labs/browse-friction
 ln -s ~/Code/labs/browse-friction/browse-friction ~/.local/bin/browse-friction
 ln -s ~/Code/labs/browse-friction/browse-corpus   ~/.local/bin/browse-corpus
 ```
