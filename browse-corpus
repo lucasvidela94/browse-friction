@@ -97,7 +97,12 @@ def run(*args, timeout=180):
     return subprocess.run(list(args), capture_output=True, text=True, timeout=timeout)
 
 
-def load_cases():
+def load_cases(path=None):
+    path = Path(path) if path else CASES
+    if path.exists():
+        return json.loads(path.read_text())["cases"]
+    if path != CASES:
+        raise SystemExit(f"no such cases file: {path}")
     if not CASES.exists():
         CASES.parent.mkdir(parents=True, exist_ok=True)
         CASES.write_text(json.dumps(DEFAULT_CASES, indent=2) + "\n")
@@ -190,13 +195,14 @@ def main():
     ap.add_argument("--browse", metavar="PATH", help="browse binary to test (default: the installed one)")
     ap.add_argument("--keep", type=int, default=20, metavar="N", help="keep the newest N runs (default 20)")
     ap.add_argument("--ci", action="store_true", help="fail only when a new flag appears, not when anything changed")
+    ap.add_argument("--cases", metavar="PATH", help="cases file (default ~/.config/browse-corpus/cases.json)")
     args = ap.parse_args()
 
     global BROWSE
     if args.browse:
         BROWSE = str(Path(args.browse).resolve())
         os.environ["BROWSE_BIN"] = BROWSE
-    cases = load_cases()
+    cases = load_cases(args.cases)
     if args.list:
         for c in cases:
             print(f"{c['name']:<20} {'html' if c.get('html') else c['url']}\n{'':<20} {c.get('why','')}")

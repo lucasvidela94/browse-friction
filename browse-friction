@@ -67,6 +67,21 @@ def sh_json(*args):
         return {"raw": p.stdout.strip(), "stderr": p.stderr.strip()}
 
 
+def settle(tab, max_seconds):
+    """Two identical snapshots in a row, or give up. A pack taken right after a
+    navigation captures skeletons: SPAs paint after load, and the snapshot of a
+    skeleton is a page with no controls."""
+    deadline = time.time() + max_seconds
+    previous = None
+    while time.time() < deadline:
+        current = sh("snapshot", str(tab)).stdout
+        if current.strip() and current == previous:
+            return current
+        previous = current
+        time.sleep(0.4)
+    return previous or ""
+
+
 def write(path: Path, text: str):
     path.write_text(text if text.endswith("\n") else text + "\n")
 
@@ -101,6 +116,11 @@ def flags_for(page, snapshot, aria, inner_text):
     compact_controls = controls_in(snapshot)
     aria_controls = controls_in(aria)
     declared = declared_in(snapshot)
+    # A truncated snapshot is short by design: maxItems cut it, nothing was lost.
+    truncated = bool(re.search(r"- \.\.\. truncated after \d+ items", snapshot))
+    # With a modal open the snapshot covers the dialog alone, by design, so the
+    # page-wide aria tree is not a fair comparison.
+    dialog_scoped = bool(re.search(r"^- dialog\b", snapshot, re.M))
     empty_landmarks = lines(r"\[0 controls\]", snapshot)
     fields_in_snapshot = [l for l in snapshot.splitlines()
                           if re.search(r"- '?(?:textbox|searchbox|combobox|checkbox|radio|slider|spinbutton)\b", l)]
@@ -116,7 +136,7 @@ def flags_for(page, snapshot, aria, inner_text):
             f"(the shape of browse #283): {empty_landmarks[0].strip()[:90]}",
         ))
 
-    if len(aria_controls) > len(compact_controls) + declared + 2:
+    if not truncated and not dialog_scoped and len(aria_controls) > len(compact_controls) + declared + 2:
         out.append((
             "controls missing",
             f"mode:aria lists {len(aria_controls)} controls; the snapshot shows {len(compact_controls)} "
@@ -223,6 +243,8 @@ def main():
     ap.add_argument("--out", help="output directory (default ./friction-<slug>-<stamp>)")
     ap.add_argument("--name", help="slug for the default directory name")
     ap.add_argument("--keep", action="store_true", help="do not close the tab opened by --url")
+    ap.add_argument("--settle", type=float, default=8.0, metavar="SECONDS",
+                    help="wait for two identical snapshots before capturing (default 8, 0 disables)")
     args = ap.parse_args()
 
     if bool(args.tab) == bool(args.url):
@@ -246,7 +268,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     status = sh_json("status", "--json")
-    snapshot = sh("snapshot", str(tab)).stdout
+    snapshot = settle(tab, args.settle) if args.settle > 0 else sh("snapshot", str(tab)).stdout
     aria = sh("snapshot", str(tab), "--mode", "aria").stdout
     inner_text = sh("eval", str(tab), "document.body.innerText").stdout
     try:
