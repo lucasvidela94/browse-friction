@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""Measure how much of a page's DOM a browse snapshot actually exposes.
+
+One number per site — controls in the snapshot over controls in the DOM — with
+the known excuses attached (truncated, dialog-scoped, no DOM controls). A site
+that renders controls and exposes none of them is the interesting bucket.
+
+    browse-coverage                      # the built-in list
+    browse-coverage --urls sites.json    # [{"name": ..., "url": ...}, ...]
+    browse-coverage --settle 10 --json out.json
+
+It reads only: no clicks, no typing.
+"""
+
+import argparse
+import json
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from browse_shared import controls_in, declared_in, has_iframes, is_dialog_scoped, is_truncated, settle  # noqa: E402
+
+BROWSE = shutil.which("browse") or "browse"
+STATE = Path.home() / ".local/state/browse-coverage"
+
+COUNTS_JS = """(() => {
+  const q = (s) => document.querySelectorAll(s).length;
+  const c = {
+    buttons: q("button"),
+    role_buttons: q("[role=button]"),
+    links: q("a[href]"),
+    fields: q("input, select, textarea"),
+    editables: q("[contenteditable=true]"),
+  };
+  c.controls = c.buttons + c.role_buttons + c.links + c.fields + c.editables;
+  return { url: location.href, title: document.title, counts: c,
+           text: document.body.innerText.length,
+           canvas: q("canvas"),
+           virtual: q("[aria-setsize], [role=row], [data-index]") };
+})()"""
+
+DEFAULT_SITES = [
+    {"name": "wikipedia-en", "url": "https://en.wikipedia.org/wiki/Web_browser", "why": "link-dense document"},
+    {"name": "wikipedia-es", "url": "https://es.wikipedia.org/wiki/Navegador_web", "why": "same in Spanish"},
+    {"name": "wikipedia-ar", "url": "https://ar.wikipedia.org/wiki/متصفح_ويب", "why": "RTL"},
+    {"name": "wikipedia-table", "url": "https://en.wikipedia.org/wiki/List_of_countries_by_GDP_(nominal)", "why": "big table"},
+    {"name": "mdn", "url": "https://developer.mozilla.org/en-US/docs/Web/API", "why": "docs sidebar"},
+    {"name": "python-docs", "url": "https://docs.python.org/3/library/asyncio.html", "why": "docs with TOC"},
+    {"name": "rust-docs", "url": "https://doc.rust-lang.org/std/", "why": "docs with a long sidebar"},
+    {"name": "react-docs", "url": "https://react.dev/learn", "why": "docs, Next.js"},
+    {"name": "stripe-docs", "url": "https://docs.stripe.com/payments", "why": "docs with search and code"},
+    {"name": "aws-docs", "url": "https://docs.aws.amazon.com/lambda/latest/dg/welcome.html", "why": "docs, heavy chrome"},
+    {"name": "hn", "url": "https://news.ycombinator.com/", "why": "table layout, hundreds of links"},
+    {"name": "bbc", "url": "https://www.bbc.com/news", "why": "news, carousels"},
+    {"name": "guardian", "url": "https://www.theguardian.com/international", "why": "news, consent wall"},
+    {"name": "npr", "url": "https://www.npr.org/", "why": "news, audio players"},
+    {"name": "aljazeera", "url": "https://www.aljazeera.net/", "why": "RTL news"},
+    {"name": "ynet", "url": "https://www.ynet.co.il/", "why": "Hebrew RTL"},
+    {"name": "amazon", "url": "https://www.amazon.com/", "why": "dense commerce, many navs"},
+    {"name": "mercadolibre", "url": "https://www.mercadolibre.com.ar/", "why": "commerce, regional"},
+    {"name": "ebay", "url": "https://www.ebay.com/", "why": "commerce, carousels"},
+    {"name": "etsy", "url": "https://www.etsy.com/", "why": "commerce, masonry"},
+    {"name": "aliexpress", "url": "https://www.aliexpress.com/", "why": "commerce, virtualized"},
+    {"name": "reddit", "url": "https://www.reddit.com/", "why": "web components"},
+    {"name": "youtube", "url": "https://www.youtube.com/", "why": "SPA, virtualized grid"},
+    {"name": "bsky", "url": "https://bsky.app/", "why": "SPA feed"},
+    {"name": "mastodon", "url": "https://mastodon.social/explore", "why": "fediverse SPA"},
+    {"name": "tiktok", "url": "https://www.tiktok.com/", "why": "video SPA"},
+    {"name": "linkedin", "url": "https://www.linkedin.com/", "why": "login wall"},
+    {"name": "x", "url": "https://x.com/", "why": "login wall"},
+    {"name": "gov-uk", "url": "https://www.gov.uk/", "why": "government, forms"},
+    {"name": "usa-gov", "url": "https://www.usa.gov/", "why": "government"},
+    {"name": "argentina-gob", "url": "https://www.argentina.gob.ar/", "why": "government, regional"},
+    {"name": "espn", "url": "https://www.espn.com/nba/standings", "why": "table with sticky header"},
+    {"name": "transfermarkt", "url": "https://www.transfermarkt.com/premier-league/tabelle/wettbewerb/GB1", "why": "table, cookie wall"},
+    {"name": "github-repo", "url": "https://github.com/anomalyco/browse", "why": "app shell outside main"},
+    {"name": "github-issues", "url": "https://github.com/anomalyco/browse/issues", "why": "long list"},
+    {"name": "github-signup", "url": "https://github.com/signup", "why": "form"},
+    {"name": "google-flights", "url": "https://www.google.com/travel/flights", "why": "heavy SPA, custom widgets"},
+    {"name": "google-maps", "url": "https://www.google.com/maps", "why": "canvas map"},
+    {"name": "osm", "url": "https://www.openstreetmap.org/", "why": "canvas map"},
+    {"name": "excalidraw", "url": "https://excalidraw.com/", "why": "canvas app"},
+    {"name": "photopea", "url": "https://www.photopea.com/", "why": "canvas app"},
+    {"name": "figma-community", "url": "https://www.figma.com/community", "why": "SPA grid"},
+    {"name": "linear", "url": "https://linear.app/", "why": "animated marketing SPA"},
+    {"name": "vercel", "url": "https://vercel.com/", "why": "dark SPA marketing"},
+    {"name": "notion", "url": "https://www.notion.so/", "why": "marketing SPA"},
+    {"name": "slack", "url": "https://slack.com/", "why": "marketing SPA"},
+    {"name": "stripe", "url": "https://stripe.com/", "why": "animated marketing"},
+    {"name": "shopify", "url": "https://www.shopify.com/", "why": "marketing, heavy"},
+    {"name": "duckduckgo", "url": "https://duckduckgo.com/?q=opencode", "why": "SERP"},
+    {"name": "bing", "url": "https://www.bing.com/search?q=opencode", "why": "SERP"},
+    {"name": "twitch", "url": "https://www.twitch.tv/", "why": "video SPA"},
+    {"name": "spotify", "url": "https://open.spotify.com/", "why": "audio SPA"},
+    {"name": "netflix", "url": "https://www.netflix.com/", "why": "video, walls"},
+    {"name": "airbnb", "url": "https://www.airbnb.com/", "why": "commerce SPA, maps"},
+    {"name": "booking", "url": "https://www.booking.com/", "why": "commerce, heavy forms"},
+]
+
+
+def sh(*args, timeout=120):
+    return subprocess.run([BROWSE, *args], capture_output=True, text=True, timeout=timeout)
+
+
+def measure(site, settle_seconds):
+    nav = sh("navigate", site["url"], timeout=90)
+    if nav.returncode != 0:
+        return {"name": site["name"], "url": site["url"], "error": (nav.stderr or nav.stdout).strip()[:160]}
+    tab = json.loads(nav.stdout)["tab"]
+    try:
+        # Count only once the page stopped changing: counting before settle measured
+        # the skeleton while the snapshot measured the page (booking.com: 0 of 185).
+        snapshot = settle(lambda: sh("snapshot", str(tab)).stdout, settle_seconds)
+        page = json.loads(sh("eval", str(tab), COUNTS_JS).stdout)
+        aria = sh("snapshot", str(tab), "--mode", "aria").stdout
+    finally:
+        sh("tabs", "close", "--tab", str(tab))
+
+    dom = page["counts"]["controls"]
+    snap = len(controls_in(snapshot))
+    declared = declared_in(snapshot)
+    notes = []
+    if dom == 0:
+        notes.append("no DOM controls")
+        if page["canvas"]:
+            notes.append("canvas")
+    if is_truncated(snapshot):
+        notes.append("truncated")
+    if is_dialog_scoped(snapshot):
+        notes.append("dialog-scoped")
+    if has_iframes(snapshot):
+        notes.append("includes iframes")
+    if dom and snap == 0:
+        notes.append("ZERO")
+    return {
+        "name": site["name"], "url": page["url"], "why": site.get("why", ""), "title": page["title"],
+        "dom": dom, "snap": snap, "aria": len(controls_in(aria)), "declared": declared,
+        "coverage": round(snap / dom, 3) if dom else None,
+        "accounted": round((snap + declared) / dom, 3) if dom else None,
+        "text": page["text"], "canvas": page["canvas"], "virtual": page["virtual"],
+        "notes": notes,
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser(description="How much of each page a browse snapshot exposes.")
+    ap.add_argument("--urls", metavar="JSON", help="[{\"name\", \"url\"}, ...] (default: built-in list)")
+    ap.add_argument("--settle", type=float, default=8.0, metavar="SECONDS")
+    ap.add_argument("--only", metavar="NAME", help="one site by name")
+    ap.add_argument("--json", metavar="PATH", help="also write the rows as JSON")
+    ap.add_argument("--list", action="store_true", help="print the sites and exit")
+    args = ap.parse_args()
+
+    sites = json.loads(Path(args.urls).read_text())["cases"] if args.urls else DEFAULT_SITES
+    if args.only:
+        sites = [s for s in sites if s["name"] == args.only]
+        if not sites:
+            sys.exit(f"no site named {args.only}")
+    if args.list:
+        for s in sites:
+            print(f"{s['name']:<18} {s['url']}")
+        return 0
+
+    rows = []
+    for site in sites:
+        try:
+            row = measure(site, args.settle)
+        except Exception as exc:  # noqa: BLE001 - one bad site must not stop the survey
+            row = {"name": site["name"], "url": site["url"], "error": str(exc)[:160]}
+        rows.append(row)
+        if "error" in row:
+            print(f"{row['name']:<18} ERROR  {row['error']}")
+        else:
+            cov = "  -  " if row["coverage"] is None else f"{row['coverage']*100:4.0f}%"
+            acc = row.get("accounted")
+            acc = "  -  " if acc is None else f"{acc*100:4.0f}%"
+            note = ",".join(row["notes"])
+            print(f"{row['name']:<18} dom {row['dom']:>4}  snap {row['snap']:>4}  aria {row['aria']:>4}  "
+                  f"decl {row['declared']:>4}  reach {cov}  all {acc}  {note}")
+
+    measured = [r for r in rows if "error" not in r]
+    zero = [r for r in measured if "ZERO" in r["notes"]]
+    low = [r for r in measured if r["coverage"] is not None and r["coverage"] < 0.2]
+    covs = sorted(r["coverage"] for r in measured if r["coverage"] is not None)
+    canvas = [r for r in measured if r["canvas"]]
+
+    print(f"\n{len(measured)} measured, {len(rows) - len(measured)} failed")
+    if covs:
+        mid = covs[len(covs) // 2]
+        print(f"coverage: median {mid*100:.0f}%  under 20%: {len(low)}")
+    print(f"exposed nothing while the DOM has controls: {len(zero)}  →  {', '.join(r['name'] for r in zero) or 'none'}")
+    print(f"pages with a canvas: {len(canvas)}  →  {', '.join(r['name'] for r in canvas) or 'none'}")
+
+    STATE.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    out = Path(args.json) if args.json else STATE / f"{stamp}.json"
+    out.write_text(json.dumps(rows, indent=2, ensure_ascii=False))
+    print(f"\nsaved: {out}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
