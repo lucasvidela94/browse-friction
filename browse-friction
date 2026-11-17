@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from browse_shared import controls_in, declared_in, is_dialog_scoped, is_truncated, settle  # noqa: E402
+from browse_shared import controls_in, declared_in, is_dialog_scoped, is_scoped, is_truncated, settle  # noqa: E402
 
 BROWSE = os.environ.get("BROWSE_BIN") or shutil.which("browse") or "browse"
 MAX_DOM_BYTES = 400_000
@@ -100,6 +100,9 @@ def flags_for(page, snapshot, aria, inner_text):
     # With a modal open the snapshot covers the dialog alone, by design, so the
     # page-wide aria tree is not a fair comparison.
     dialog_scoped = is_dialog_scoped(snapshot)
+    # A scope note already says these controls exist and are not shown; that is the
+    # documented behaviour, not a finding.
+    scoped = is_scoped(snapshot)
     empty_landmarks = lines(r"\[0 controls\]", snapshot)
     fields_in_snapshot = [l for l in snapshot.splitlines()
                           if re.search(r"- '?(?:textbox|searchbox|combobox|checkbox|radio|slider|spinbutton)\b", l)]
@@ -125,7 +128,7 @@ def flags_for(page, snapshot, aria, inner_text):
             f"and declares {declared} collapsed",
         ))
 
-    if c["fields"] > 0 and not fields_in_snapshot and declared > 0:
+    if c["fields"] > 0 and not fields_in_snapshot and declared > 0 and not scoped:
         out.append((
             "fields behind a summary",
             f"the DOM has {c['fields']} field(s) and no field is visible while {declared} controls are hidden "

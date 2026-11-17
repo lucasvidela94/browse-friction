@@ -39,6 +39,11 @@ def is_dialog_scoped(text):
     return bool(_DIALOG.search(text))
 
 
+def is_scoped(text):
+    """A note naming what a <main>-scoped snapshot left out: already accounted for."""
+    return bool(_SCOPED.search(text))
+
+
 def has_iframes(text):
     return bool(_IFRAME.search(text))
 
